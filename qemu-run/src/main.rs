@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use defmt_decoder::{
     log::{
         format::{Formatter, FormatterConfig, HostFormatter},
@@ -22,13 +22,17 @@ use defmt_decoder::{
 };
 use process::Child;
 
-/// Run qemu-system-arm, takes defmt logs from semihosting output and prints them to stdout
+/// Run a QEMU system emulator, takes defmt logs from semihosting output and prints them to stdout
 #[derive(clap::Parser, Clone)]
 #[command(name = "qemu-run")]
 struct Opts {
     /// The firmware running on the device being logged
     #[arg(required = true)]
     elf: Option<std::path::PathBuf>,
+
+    /// Specify the target architecture
+    #[arg(long, default_value = "arm")]
+    arch: Arch,
 
     /// Specify the QEMU machine type
     #[arg(long, required = true)]
@@ -47,16 +51,39 @@ struct Opts {
     version: bool,
 
     /// Set up UART0 as a telnet server instead of piping to the console
-    #[arg(short = 't', long, alias = "uart-telnet")]
+    #[arg(short = 't', long, alias = "uart-telnet", conflicts_with = "uart_pty")]
     uart_telnet: bool,
 
-    /// Use qemu-system-aarch64 instead of qemu-system-arm
+    /// Redirect UART0 to a PTY (QEMU will print the allocated device path)
+    #[arg(long, alias = "uart-pty", conflicts_with = "uart_telnet")]
+    uart_pty: bool,
+
+    /// Specify a BIOS file, or "none" to disable the default BIOS
     #[arg(long)]
-    aarch64: bool,
+    bios: Option<String>,
 
     /// Print verbose log output
     #[arg(short = 'v', long)]
     verbose: bool,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Arch {
+    Arm,
+    Aarch64,
+    Riscv32,
+    Riscv64,
+}
+
+impl Arch {
+    fn qemu_binary(self) -> &'static str {
+        match self {
+            Arch::Arm => "qemu-system-arm",
+            Arch::Aarch64 => "qemu-system-aarch64",
+            Arch::Riscv32 => "qemu-system-riscv32",
+            Arch::Riscv64 => "qemu-system-riscv64",
+        }
+    }
 }
 
 fn main() -> Result<(), anyhow::Error> {
@@ -135,14 +162,10 @@ fn notmain() -> Result<Option<i32>, anyhow::Error> {
     defmt_decoder::log::init_logger(formatter, host_formatter, DefmtLoggerType::Stdout, |_| true);
 
     //
-    // Set up the qemu-system-arm command line
+    // Set up the qemu-system command line
     //
 
-    let mut command = Command::new(if opts.aarch64 {
-        "qemu-system-aarch64"
-    } else {
-        "qemu-system-arm"
-    });
+    let mut command = Command::new(opts.arch.qemu_binary());
     // set the mandatory machine type
     command.args(["-machine", &machine]);
     // set the optional CPU type
@@ -150,13 +173,18 @@ fn notmain() -> Result<Option<i32>, anyhow::Error> {
         command.arg("-cpu");
         command.arg(cpu);
     }
-    // create a character device connected to `uart_socket`
+    // create a telnet server and tell QEMU to use it for UART0. Connect to localhost:4321 to interact with it.
     if opts.uart_telnet {
         command.arg("-chardev");
         command.arg("socket,id=sock0,server=on,telnet=on,port=4321,host=localhost");
+        command.args(["-serial", "chardev:sock0"]);
         log::info!(
             "Told QEMU to start telnet server on localhost:4321. Connect to interact with UART0."
         );
+    // create a PTY and tell QEMU to use it for UART0. QEMU will print the allocated device path on startup.
+    } else if opts.uart_pty {
+        command.args(["-serial", "pty"]);
+    // create a character device connected to `uart_socket`
     } else {
         let uart_socket = std::net::TcpListener::bind("localhost:0")
             .with_context(|| "Binding free port on localhost")?;
@@ -174,15 +202,18 @@ fn notmain() -> Result<Option<i32>, anyhow::Error> {
             "socket,id=sock0,server=off,telnet=off,port={},host=localhost",
             uart_socket_addr.port()
         ));
+        command.args(["-serial", "chardev:sock0"]);
     }
-    // send UART0 output to the chardev we just made
-    command.args(["-serial", "chardev:sock0"]);
     // disable the graphical output
     command.arg("-nographic");
     // disable the command monitor
     command.args(["-monitor", "none"]);
     // send semihosting to stdout
     command.args(["-semihosting-config", "enable=on,target=native"]);
+    // set the BIOS (if specified)
+    if let Some(bios) = &opts.bios {
+        command.args(["-bios", bios]);
+    }
     // set the firmware to load
     command.arg("-kernel");
     command.arg(elf_path);
@@ -193,11 +224,12 @@ fn notmain() -> Result<Option<i32>, anyhow::Error> {
     // Run QEMU
     //
 
-    let mut child = KillOnDrop(
-        command
-            .spawn()
-            .expect("Error running qemu-system-arm; perhaps you haven't installed it yet?"),
-    );
+    let mut child = KillOnDrop(command.spawn().unwrap_or_else(|_| {
+        panic!(
+            "Error running {}; perhaps you haven't installed it yet?",
+            opts.arch.qemu_binary()
+        )
+    }));
 
     //
     // Decode stdout as defmt data
@@ -210,6 +242,15 @@ fn notmain() -> Result<Option<i32>, anyhow::Error> {
         .stdout
         .take()
         .ok_or_else(|| anyhow!("failed to acquire child's stdout handle"))?;
+
+    // QEMU prints "char device redirected to ..." on stdout when using -serial pty,
+    // which would corrupt the defmt stream. Consume and print those lines first.
+    if opts.uart_pty {
+        let mut reader = std::io::BufReader::new(&mut stdout);
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        eprint!("{}", line);
+    }
 
     let mut decoder = table.new_stream_decoder();
 
